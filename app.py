@@ -1,48 +1,39 @@
 import os
-import pandas as pd
 import numpy as np
+import pandas as pd
 import plotly.express as px
 
-from dash import Dash, dcc, html, Input, Output, dash_table
+from dash import Dash, dcc, html, Input, Output
 import dash_bootstrap_components as dbc
 
 # ========== Load & Prepare Data ==========
-
-# --- Path หลัก (ใช้ไฟล์เล็กตามที่ตกลง)
 MAIN_CSV = "data/clean_loan_small.csv"
 
 def safe_read_csv(path, **kwargs):
-    if os.path.exists(path):
-        return pd.read_csv(path, **kwargs)
-    return None
+    return pd.read_csv(path, **kwargs) if os.path.exists(path) else None
 
-# โหลดข้อมูลหลัก
 if not os.path.exists(MAIN_CSV):
     raise FileNotFoundError(
-        f"ไม่พบไฟล์ {MAIN_CSV} กรุณาสร้างด้วย create_small_data.py หรือเช็ก path ให้ถูกต้อง"
+        f"File {MAIN_CSV} not found. Create it with create_small_data.py or check the path."
     )
 
 df = pd.read_csv(MAIN_CSV)
 df.columns = df.columns.str.strip().str.lower()
 
-# พยายามโหลดไฟล์อื่นตามของเดิม (ถ้ามี)
 feature_importance = safe_read_csv("data/feature_importance.csv")
-feature_defs_csv = safe_read_csv("data/feature_definitions_filtered.csv")
+feature_defs_csv   = safe_read_csv("data/feature_definitions_filtered.csv")
 
-# ----- Clean & map loan_status เป็น 0/1 -----
+# loan_status -> 0/1
 if "loan_status" not in df.columns:
-    raise ValueError("❌ Column 'loan_status' not found. กรุณาเช็กคอลัมน์ในไฟล์ข้อมูล")
-
+    raise ValueError("Column 'loan_status' not found.")
 if df["loan_status"].dtype == object:
     df["loan_status"] = (
-        df["loan_status"]
-        .astype(str).str.strip().str.lower()
+        df["loan_status"].astype(str).str.strip().str.lower()
         .map({"fully paid": 0, "paid": 0, "charged off": 1, "default": 1})
-        .fillna(0)
-        .astype(int)
+        .fillna(0).astype(int)
     )
 
-# income_group (ถ้าไม่มีจะคำนวณจาก annual_inc)
+# income_group
 if "income_group" not in df.columns:
     if "annual_inc" in df.columns:
         df["income_group"] = pd.qcut(
@@ -51,118 +42,83 @@ if "income_group" not in df.columns:
     else:
         df["income_group"] = "Unknown"
 
-# prediction column (ถ้าไม่มีให้ใช้ loan_status เป็นค่าเริ่ม)
+# prediction (fallback)
 if "prediction" not in df.columns:
     df["prediction"] = df["loan_status"]
 
-# Default rate by income group
+# ---------- Data for Fairness Tab ----------
+# policy: prediction==0 = approved, prediction==1 = rejected
+approval_by_income = (
+    (df["prediction"] == 0)
+    .groupby(df["income_group"], observed=False)
+    .mean()
+    .reset_index()
+    .rename(columns={"prediction": "Approval Rate", "income_group": "Income Group"})
+)
+
 default_by_income = (
     df.groupby("income_group", observed=False)["loan_status"]
       .mean()
       .reset_index()
-      .rename(columns={"loan_status": "Default Rate"})
+      .rename(columns={"loan_status": "Default Rate", "income_group": "Income Group"})
 )
 
-# TPR & FPR by income group
-metrics_by_group = []
-for group in df["income_group"].unique():
-    subset = df[df["income_group"] == group]
-    TP = ((subset["loan_status"] == 1) & (subset["prediction"] == 1)).sum()
-    FN = ((subset["loan_status"] == 1) & (subset["prediction"] == 0)).sum()
-    FP = ((subset["loan_status"] == 0) & (subset["prediction"] == 1)).sum()
-    TN = ((subset["loan_status"] == 0) & (subset["prediction"] == 0)).sum()
-    TPR = TP / (TP + FN) if (TP + FN) > 0 else 0
-    FPR = FP / (FP + TN) if (FP + TN) > 0 else 0
-    metrics_by_group.append({"Income Group": str(group), "TPR": TPR, "FPR": FPR})
-df_fairness = pd.DataFrame(metrics_by_group)
+approval_default_df = approval_by_income.merge(default_by_income, on="Income Group", how="inner")
 
-# Summary metrics (ใส่ค่าเบื้องต้น ถ้ามีของจริงค่อยแทน)
-group_metrics = {
-    "default_rate": float(df["loan_status"].mean()),
-    "reject_rate": 0.30,
-    "dir": 1.25
-}
+# KPIs
+overall_default_rate = df["loan_status"].mean()             # 0..1
+overall_approval_rate = (df["prediction"] == 0).mean()
+overall_reject_rate   = 1 - overall_approval_rate
+_dir_series = approval_default_df.set_index("Income Group")["Approval Rate"]
+dir_val = (_dir_series.min() / _dir_series.max()) if _dir_series.max() > 0 else np.nan
 
-# PDP Mock Data (ถ้าไม่มีของจริง)
+# Charts (Fairness tab)
+fig_default_by_income = px.bar(
+    default_by_income,
+    x="Income Group", y="Default Rate",
+    color="Default Rate", color_continuous_scale="Reds",
+    title="Default Rate by Income Group"
+)
+fig_default_by_income.update_yaxes(title="Default Rate", range=[0, 1])
+fig_default_by_income.update_xaxes(title="Income Group")
+fig_default_by_income.update_layout(margin=dict(l=10, r=10, t=40, b=10))
+
+fig_approve_default = px.bar(
+    approval_default_df.melt(id_vars="Income Group", var_name="Metric", value_name="Rate"),
+    x="Income Group", y="Rate", color="Metric", barmode="group",
+    title="Approval Rate vs Default Rate by Income Group",
+    color_discrete_map={"Approval Rate": "#5469d4", "Default Rate": "#e45756"}
+)
+fig_approve_default.update_yaxes(title="Rate", range=[0, 1])
+fig_approve_default.update_xaxes(title="Income Group")
+fig_approve_default.update_layout(margin=dict(l=10, r=10, t=40, b=10))
+
+# ---------- PDP mock (kept) ----------
 pdp_data = pd.DataFrame({
     "Value": list(range(10)),
-    "Prediction": [0.2, 0.25, 0.3, 0.33, 0.31, 0.35, 0.36, 0.32, 0.3, 0.28]
+    "Prediction": [0.2, 0.25, 0.3, 0.33, 0.31, 0.35, 0.36, 0.32, 0.30, 0.28]
 })
 
-# Feature definitions (ถ้าไม่มีไฟล์ ให้ใช้ชุดสั้น ๆ)
-if feature_defs_csv is not None and {"Feature","Description"}.issubset(set(feature_defs_csv.columns)):
-    df_def = feature_defs_csv[["Feature","Description"]].copy()
+# Feature Definitions (English)
+if feature_defs_csv is not None and {"Feature", "Description"}.issubset(feature_defs_csv.columns):
+    df_def = feature_defs_csv[["Feature", "Description"]].copy()
 else:
-    feature_descriptions = [
-        {"Feature": "loan_amnt", "Description": "จำนวนเงินที่ผู้กู้ขอ"},
-        {"Feature": "term", "Description": "ระยะเวลาเงินกู้"},
-        {"Feature": "int_rate", "Description": "อัตราดอกเบี้ย"},
-        {"Feature": "installment", "Description": "ยอดผ่อนรายเดือน"},
-        {"Feature": "grade", "Description": "เกรดเครดิต"},
-        {"Feature": "annual_inc", "Description": "รายได้ต่อปี"},
-        {"Feature": "loan_status", "Description": "สถานะสินเชื่อ"},
-        {"Feature": "dti", "Description": "อัตราส่วนหนี้สิน"},
-        {"Feature": "revol_bal", "Description": "หนี้หมุนเวียน"},
-        {"Feature": "revol_util", "Description": "วงเงินที่ใช้ (%)"},
-    ]
-    df_def = pd.DataFrame(feature_descriptions)
+    df_def = pd.DataFrame([
+        {"Feature": "loan_amnt",   "Description": "Loan amount requested by the borrower"},
+        {"Feature": "term",        "Description": "Loan term (in months)"},
+        {"Feature": "int_rate",    "Description": "Interest rate (%)"},
+        {"Feature": "installment", "Description": "Monthly installment amount"},
+        {"Feature": "grade",       "Description": "Credit grade assigned by LendingClub"},
+        {"Feature": "annual_inc",  "Description": "Borrower's annual income"},
+        {"Feature": "loan_status", "Description": "Loan repayment status (0=paid, 1=default)"},
+        {"Feature": "dti",         "Description": "Debt-to-Income ratio"},
+        {"Feature": "revol_bal",   "Description": "Revolving credit balance"},
+        {"Feature": "revol_util",  "Description": "Revolving credit utilization (%)"},
+    ])
 
-# ========== (Option) Train and Evaluate Models ==========
-# รันแบบเบา ๆ จากคอลัมน์ตัวเลขเท่านั้น (ถ้ามี)
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.neural_network import MLPClassifier
-try:
-    from xgboost import XGBClassifier
-    HAS_XGB = True
-except Exception:
-    HAS_XGB = False
-
-df_num = df.select_dtypes(include=[np.number]).copy()
-df_num = df_num.drop(columns=[c for c in ["prediction"] if c in df_num.columns], errors="ignore")
-
-results = []
-try:
-    if "loan_status" in df_num.columns and df_num.shape[1] > 1:
-        X = df_num.drop(columns=["loan_status"])
-        y = df_num["loan_status"]
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y if y.nunique()==2 else None
-        )
-
-        models = {
-            "Random Forest": RandomForestClassifier(n_estimators=200, random_state=42),
-            "Neural Network": MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=300, random_state=42)
-        }
-        if HAS_XGB:
-            models["XGBoost"] = XGBClassifier(
-                n_estimators=200, max_depth=4, learning_rate=0.1,
-                subsample=0.8, colsample_bytree=0.8, eval_metric="logloss", random_state=42
-            )
-
-        for name, model in models.items():
-            model.fit(X_train, y_train)
-            preds = model.predict(X_test)
-            acc = accuracy_score(y_test, preds)
-            prec = precision_score(y_test, preds, zero_division=0)
-            rec = recall_score(y_test, preds, zero_division=0)
-            auc = roc_auc_score(y_test, preds) if y.nunique()==2 else np.nan
-            results.append({
-                "Model": name,
-                "Accuracy": round(acc, 3),
-                "Precision": round(prec, 3),
-                "Recall": round(rec, 3),
-                "AUC": round(auc, 3) if not np.isnan(auc) else "NA"
-            })
-except Exception as e:
-    results = [{"Model": "Error", "Accuracy": "-", "Precision": "-", "Recall": "-", "AUC": str(e)}]
-
-df_results = pd.DataFrame(results)
-
-# ========== Dash App (layout แบบเดิม) ==========
+# ========== Dash App ==========
 app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY])
-server = app.server  # สำคัญสำหรับ Render
+server = app.server
 
 app.layout = dbc.Container([
     html.H2("Lending Club Loan Dashboard", style={'textAlign': 'center', 'marginTop': '20px'}),
@@ -172,94 +128,108 @@ app.layout = dbc.Container([
         dbc.Tab(label='Model Explainability', children=[
             html.Br(),
             html.H4("Feature Importance", id="fi-label"),
-            dbc.Tooltip("แสดงความสำคัญของแต่ละฟีเจอร์", target="fi-label"),
+            dbc.Tooltip("Relative importance of each feature", target="fi-label"),
             dcc.Graph(
                 figure=(
                     px.bar(
                         feature_importance.head(10), x='Feature', y='Importance',
-                        color='Importance', color_continuous_scale='Blues'
+                        color='Importance', color_continuous_scale='Blues',
+                        title="Top 10 Features by Importance"
                     )
                     if (feature_importance is not None and
-                        {"Feature","Importance"}.issubset(set(feature_importance.columns)))
-                    else px.bar(pd.DataFrame({"Feature":[],"Importance":[]}), x="Feature", y="Importance")
+                        {"Feature", "Importance"}.issubset(set(feature_importance.columns)))
+                    else px.bar(pd.DataFrame({"Feature": [], "Importance": []}), x="Feature", y="Importance")
                 )
             ),
-
             html.H4("Partial Dependence Plot", id="pdp-label"),
-            dbc.Tooltip("ความสัมพันธ์ของฟีเจอร์กับผลลัพธ์", target="pdp-label"),
-            dcc.Graph(figure=px.line(pdp_data, x='Value', y='Prediction')),
-
-            html.H5("TPR & FPR by Income Group", id="roc-label"),
-            dbc.Tooltip("TPR/FPR ของแต่ละกลุ่ม", target="roc-label"),
-            dcc.Graph(
-                figure=px.bar(
-                    df_fairness.melt(id_vars='Income Group', var_name='Metric', value_name='Rate'),
-                    x='Income Group', y='Rate', color='Metric', barmode='group'
-                )
-            ),
+            dbc.Tooltip("Relationship between a feature value and predicted outcome", target="pdp-label"),
+            dcc.Graph(figure=px.line(pdp_data, x='Value', y='Prediction', title="Partial Dependence Plot")),
         ]),
 
         # ----- Tab 2: Fairness & Transparency -----
         dbc.Tab(label='Fairness & Transparency', children=[
             html.Br(),
+
+            # KPI cards + tooltips
             dbc.Row([
-                dbc.Col(html.Div([
-                    html.H6("Default Rate"),
-                    html.H3(f"{group_metrics['default_rate']*100:.1f}%")
-                ]), width=4),
-                dbc.Col(html.Div([
-                    html.H6("DIR"),
-                    html.H3(f"{group_metrics['dir']:.2f}")
-                ]), width=4),
-                dbc.Col(html.Div([
-                    html.H6("Reject Rate"),
-                    html.H3(f"{group_metrics['reject_rate']*100:.0f}%")
-                ]), width=4),
+                dbc.Col(dbc.Card(dbc.CardBody([
+                    html.H6("Default Rate", id="tt-default-rate"),
+                    html.H3(f"{overall_default_rate*100:.1f}%")
+                ]), className="mb-3"), md=4),
+
+                dbc.Col(dbc.Card(dbc.CardBody([
+                    html.H6("DIR (Approval)", id="tt-dir"),
+                    html.H3("NA" if np.isnan(dir_val) else f"{dir_val:.2f}"),
+                    html.Small("≥ 0.80 passes the 80% rule", className="text-muted")
+                ]), className="mb-3"), md=4),
+
+                dbc.Col(dbc.Card(dbc.CardBody([
+                    html.H6("Reject Rate", id="tt-reject-rate"),
+                    html.H3(f"{overall_reject_rate*100:.0f}%")
+                ]), className="mb-3"), md=4),
             ]),
-            html.Hr(),
-            html.H5("Default Rate by Income Group"),
-            dcc.Graph(
-                figure=px.bar(
-                    default_by_income, x='income_group', y='Default Rate',
-                    color='Default Rate', color_continuous_scale='Reds'
-                )
+
+            # Tooltips for KPI cards
+            dbc.Tooltip(
+                "Overall proportion of loans that defaulted (1 = default).",
+                target="tt-default-rate", placement="bottom"
             ),
+            dbc.Tooltip(
+                "Disparate Impact Ratio on approval rate = min(group approval) / max(group approval). "
+                "Values ≥ 0.80 typically pass the 80% rule.",
+                target="tt-dir", placement="bottom"
+            ),
+            dbc.Tooltip(
+                "Percentage of applications that are rejected by the current policy (prediction==1).",
+                target="tt-reject-rate", placement="bottom"
+            ),
+
+            html.Hr(),
+
+            # Chart 1 + tooltip
+            html.H5("Default Rate by Income Group", id="tt-dr-chart"),
+            dbc.Tooltip(
+                "Compares default risk across income groups. Higher bars mean higher default rates.",
+                target="tt-dr-chart", placement="right"
+            ),
+            dcc.Graph(figure=fig_default_by_income),
+
+            html.Hr(),
+
+            # Chart 2 + tooltip
+            html.H5("Approval vs Default Rate by Income Group", id="tt-adv-chart"),
+            dbc.Tooltip(
+                "Blue = approval rate (share approved). Red = default rate (share that defaulted). "
+                "Use together to assess policy vs. risk.",
+                target="tt-adv-chart", placement="right"
+            ),
+            dcc.Graph(figure=fig_approve_default),
         ]),
 
-        # ----- Tab 3: Model Performance -----
-        dbc.Tab(label='Model Performance', children=[
-            html.Br(),
-            html.H4("เปรียบเทียบผลลัพธ์ของโมเดล", style={'marginTop': '5px'}),
-            dash_table.DataTable(
-                columns=[{"name": i, "id": i} for i in df_results.columns],
-                data=df_results.to_dict('records'),
-                style_table={'overflowX': 'auto'},
-                style_cell={'textAlign': 'center'},
-                style_header={'backgroundColor': 'rgb(30, 30, 30)', 'color': 'white'},
-                style_data={'backgroundColor': 'rgb(50, 50, 50)', 'color': 'white'}
-            )
-        ]),
-
-        # ----- Tab 4: Feature Definitions -----
+        # ----- Tab 3: Feature Definitions -----
         dbc.Tab(label='Feature Definitions', children=[
             html.Br(),
-            dbc.Input(id='search-input', placeholder="🔍 ค้นหาฟีเจอร์...", debounce=True),
+            dbc.Input(id='search-input', placeholder="🔍 Search for a feature...", debounce=True),
             html.Div(id='feature-table', className="mt-3")
         ]),
     ])
 ], fluid=True)
 
-# ========== Callback: ค้นหาฟีเจอร์ ==========
+# ========== Callback: Feature search ==========
 @app.callback(
     Output('feature-table', 'children'),
     Input('search-input', 'value')
 )
 def update_table(search_value):
+    if df_def.empty:
+        return html.P("No feature definitions available.", style={"color": "orange"})
     filtered = df_def.copy()
     if search_value:
-        filtered = filtered[filtered['Feature'].astype(str).str.contains(str(search_value), case=False, na=False)]
+        filtered = filtered[
+            filtered['Feature'].astype(str).str.contains(str(search_value), case=False, na=False)
+        ]
     if filtered.empty:
-        return html.P("ไม่พบฟีเจอร์ที่ค้นหา", style={"color": "red"})
+        return html.P("No matching features found", style={"color": "red"})
     return dbc.Table.from_dataframe(filtered, striped=True, bordered=True, hover=True)
 
 # ========== Run ==========
