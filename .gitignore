@@ -1,5 +1,5 @@
 # Ignore data files
-data/*.csv
+# data/*.csv
 data/*.parquet
 clean_loan_v2.csv
 lending_club_loan_two.csv
@@ -10,3 +10,7 @@ venv/
 # Ignore system/cache files
 __pycache__/
 .DS_Store
+
+!data/clean_loan_small.csv
+!data/feature_importance.csv
+!data/feature_definitions_filtered.csv
