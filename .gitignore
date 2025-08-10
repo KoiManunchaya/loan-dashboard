@@ -1,0 +1,12 @@
+# Ignore data files
+data/*.csv
+data/*.parquet
+clean_loan_v2.csv
+lending_club_loan_two.csv
+
+# Ignore virtual environment
+venv/
+
+# Ignore system/cache files
+__pycache__/
+.DS_Store
